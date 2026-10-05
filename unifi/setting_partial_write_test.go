@@ -2,15 +2,10 @@ package unifi
 
 import (
 	"context"
-	"encoding/json"
-	"io"
-	"net/http"
-	"net/http/httptest"
+	"errors"
 	"reflect"
-	"sync"
 	"testing"
 
-	"github.com/ubiquiti-community/go-unifi/unifi"
 	"github.com/ubiquiti-community/go-unifi/unifi/settings"
 )
 
@@ -114,6 +109,7 @@ func Test_jsonValuesEqual(t *testing.T) {
 		{float64(276), "276", true},
 		{[]any{"36"}, []any{"36", "40"}, false},
 		{[]any{"36"}, "36", false},
+		{map[string]any{"a": "1"}, map[string]any{"a": float64(1)}, true},
 		{map[string]any{"a": "1"}, map[string]any{"a": "1", "b": "2"}, false},
 		{map[string]any{"a": "1"}, map[string]any{"a": float64(2)}, false},
 		{map[string]any{"a": "1"}, []any{"1"}, false},
@@ -122,61 +118,6 @@ func Test_jsonValuesEqual(t *testing.T) {
 		if got := jsonValuesEqual(tt.a, tt.b); got != tt.want {
 			t.Errorf("jsonValuesEqual(%v, %v) = %v, want %v", tt.a, tt.b, got, tt.want)
 		}
-	}
-}
-
-// newSettingsFakeController serves the given stored settings and records every
-// setting PUT body by key.
-func newSettingsFakeController(
-	t *testing.T,
-	stored []map[string]any,
-) (*settingResource, func() map[string]map[string]any) {
-	t.Helper()
-	var mu sync.Mutex
-	puts := map[string]map[string]any{}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/" {
-			http.Redirect(w, r, "/manage", http.StatusFound)
-			return
-		}
-		http.NotFound(w, r)
-	})
-	mux.HandleFunc("/api/login", func(w http.ResponseWriter, r *http.Request) {
-		http.SetCookie(w, &http.Cookie{Name: "unifises", Value: "fake-session", Path: "/"})
-		_, _ = w.Write([]byte(`{"meta":{"rc":"ok"},"data":[]}`))
-	})
-	mux.HandleFunc("/api/s/default/get/setting", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).
-			Encode(map[string]any{"meta": map[string]any{"rc": "ok"}, "data": stored})
-	})
-	mux.HandleFunc("/api/s/default/set/setting/", func(w http.ResponseWriter, r *http.Request) {
-		b, _ := io.ReadAll(r.Body)
-		var body map[string]any
-		if err := json.Unmarshal(b, &body); err != nil {
-			t.Errorf("PUT body is not JSON: %v", err)
-		}
-		mu.Lock()
-		puts[r.URL.Path[len("/api/s/default/set/setting/"):]] = body
-		mu.Unlock()
-		_ = json.NewEncoder(w).
-			Encode(map[string]any{"meta": map[string]any{"rc": "ok"}, "data": []any{body}})
-	})
-
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-	apiClient, err := unifi.New(context.Background(), &unifi.Config{
-		BaseURL: srv.URL, Username: "admin", Password: "admin",
-	})
-	if err != nil {
-		t.Fatalf("creating client against fake controller: %v", err)
-	}
-	r := &settingResource{client: &Client{ApiClient: apiClient, Site: "default"}}
-	return r, func() map[string]map[string]any {
-		mu.Lock()
-		defer mu.Unlock()
-		return puts
 	}
 }
 
@@ -243,5 +184,47 @@ func Test_isZeroJSON(t *testing.T) {
 		if got := isZeroJSON(tt.v); got != tt.want {
 			t.Errorf("isZeroJSON(%#v) = %v, want %v", tt.v, got, tt.want)
 		}
+	}
+}
+
+// rawJSONSetting marshals to a fixed JSON text, to exercise settingChanges on
+// bodies the typed settings never produce.
+type rawJSONSetting struct {
+	settings.BaseSetting
+	json string
+}
+
+func (s *rawJSONSetting) MarshalJSON() ([]byte, error) {
+	if s.json == "" {
+		return nil, errors.New("cannot marshal")
+	}
+	return []byte(s.json), nil
+}
+
+func Test_settingChanges_errors(t *testing.T) {
+	if _, err := settingChanges(nil, &rawJSONSetting{}); err == nil {
+		t.Error("marshal failure: want error")
+	}
+	if _, err := settingChanges(nil, &rawJSONSetting{json: `["not", "an", "object"]`}); err == nil {
+		t.Error("non-object body: want error")
+	}
+}
+
+func Test_writeSetting_errors(t *testing.T) {
+	ctx := context.Background()
+
+	r, _ := newSettingsFakeController(t, nil)
+	if err := r.writeSetting(ctx, "default", &rawJSONSetting{json: `{}`}); err == nil {
+		t.Error("setting without a known key: want error")
+	}
+	if err := r.writeSetting(ctx, "default", &settings.Country{Code: ptrInt64(276)}); err != nil {
+		t.Errorf("baseline write failed: %v", err)
+	}
+	if err := r.writeSetting(
+		ctx,
+		"other-site",
+		&settings.Country{Code: ptrInt64(276)},
+	); err == nil {
+		t.Error("unreadable stored settings: want error")
 	}
 }
